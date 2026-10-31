@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>Redis 学习手册 · 从小白到高手</title>
+<script>
+(function(){var p=null;try{p=localStorage.getItem("learn-redis:theme")}catch(e){}
+var d=p==="dark"||(p!=="light"&&matchMedia("(prefers-color-scheme: dark)").matches);
+document.documentElement.dataset.theme=d?"dark":"light";})();
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23D82C20'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='13' font-weight='700' fill='white' text-anchor='middle'%3ERd%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="logo">Rd</span>Redis 学习手册</a>
+  <nav class="nav" id="nav">
+    <a href="#/" data-r="home">学习路线</a>
+    <a href="#/learn" data-r="learn">课程</a>
+    <a href="#/quiz" data-r="quiz">练习题</a>
+    <a href="#/bank" data-r="bank">面试题库</a>
+    <a href="#/cmd" data-r="cmd">命令手册</a>
+  </nav>
+  <button class="theme" id="theme" type="button" title="切换配色"></button>
+</header>
+<div id="app"><p class="loading">加载中…</p></div>
+<button id="totop" class="totop" type="button" title="回到顶部">↑</button>
+<script src="data/ch1.js"></script>
+<script src="data/ch2.js"></script>
+<script src="data/ch3.js"></script>
+<script src="data/ch4.js"></script>
+<script src="data/ch5.js"></script>
+<script src="data/ch6.js"></script>
+<script src="data/cmds.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

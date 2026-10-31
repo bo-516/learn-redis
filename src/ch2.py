@@ -1,0 +1,305 @@
+from h import *
+CH = dict(id="types", code="TYPE", stage=1, name="数据结构：Hash / List / Set / ZSet 与特殊类型",
+desc="五大核心结构的命令、底层编码与适用场景，以及 Bitmap、HyperLogLog、Geo。",
+lesson=r'''
+## 1. Hash：对象的字段级存取
+
+Hash 是 field → value 的映射，适合存"一个对象的多个属性"，可以只读写其中一个字段。
+
+```
+HSET user:1 name Alice age 30 city Beijing
+HGET user:1 name
+HMGET user:1 name age
+HINCRBY user:1 age 1
+HEXISTS user:1 email
+HDEL user:1 city
+HLEN user:1
+HGETALL user:1        # 字段多时慎用，O(N)
+HSCAN user:1 0 COUNT 100
+```
+
+**Hash vs String 存 JSON**：Hash 可以字段级更新、省去整体序列化；String 存 JSON 读整对象更简单、可以整体设置 TTL。Redis 7.4 起 Hash 支持**字段级过期**（`HEXPIRE`、`HTTL`、`HPERSIST`），8.0 又新增了 `HGETEX`、`HSETEX`、`HGETDEL`。
+
+**编码**：字段数 ≤ `hash-max-listpack-entries`（默认 128）且每个值 ≤ `hash-max-listpack-value`（默认 64 字节）时用紧凑的 **listpack**，否则转为 **hashtable**。listpack 内存非常省，但查找是 O(N)，所以阈值不宜调得太大。
+
+## 2. List：有序、可重复、两端操作快
+
+List 是按插入顺序排列的字符串列表，两端 push/pop 是 O(1)，按下标访问是 O(N)。
+
+```
+LPUSH q a b c        # 左侧插入，结果 c b a
+RPUSH q d
+LPOP q / RPOP q
+LRANGE q 0 -1        # 全部
+LLEN q
+LINDEX q 0
+LTRIM q 0 99         # 只保留前 100 个（最新动态列表常用）
+BRPOP q 5            # 阻塞弹出，最多等 5 秒
+LMOVE src dst LEFT RIGHT   # 原子移动（替代 RPOPLPUSH）
+BLMOVE src dst RIGHT LEFT 0
+LPOS q c             # 查元素位置
+```
+
+**典型用法**：
+- 消息队列：`LPUSH` + `BRPOP`（简单但无 ACK，消费者崩溃会丢消息）；
+- 可靠队列：`BLMOVE` 把任务移到"处理中"列表，处理完再 `LREM`；
+- 最新 N 条：`LPUSH` + `LTRIM`。
+
+**编码**：底层是 **quicklist**（由多个 listpack 节点组成的双向链表）；7.2 起元素很少时直接用单个 listpack。
+
+## 3. Set：无序、去重
+
+```
+SADD tags:redis cache db nosql
+SISMEMBER tags:redis cache   # O(1)
+SMISMEMBER tags:redis cache x
+SMEMBERS tags:redis          # 大集合慎用
+SCARD tags:redis
+SREM tags:redis nosql
+SRANDMEMBER tags:redis 2     # 随机取，不删除
+SPOP tags:redis              # 随机弹出（抽奖）
+SINTER u:1:follow u:2:follow # 交集：共同关注
+SUNION / SDIFF
+SINTERSTORE dest k1 k2
+SINTERCARD 2 k1 k2 LIMIT 10  # 只要交集数量
+```
+
+**编码**：全是整数且数量 ≤ 512 时用 **intset**；7.2 起元素少且短时用 **listpack**；否则 **hashtable**。
+
+## 4. Sorted Set（ZSet）：带分数的有序集合
+
+每个成员唯一，并关联一个 double 分数，按分数排序（分数相同按成员字典序）。
+
+```
+ZADD rank 100 alice 95 bob 88 carol
+ZINCRBY rank 10 bob
+ZSCORE rank alice
+ZRANK rank alice / ZREVRANK rank alice   # 名次（0 开始）
+ZRANGE rank 0 9 REV WITHSCORES           # Top10（6.2 统一语法）
+ZRANGE rank 80 100 BYSCORE LIMIT 0 10
+ZCOUNT rank 90 +inf
+ZREM rank carol
+ZREMRANGEBYSCORE delay 0 1730000000
+ZPOPMIN / BZPOPMIN
+```
+
+`ZADD` 选项：`NX`（只新增）、`XX`（只更新）、`GT/LT`（新分数更大/更小才更新）、`CH`（返回变更数）、`INCR`。
+
+**编码**：元素 ≤ 128 且成员 ≤ 64 字节时用 listpack；否则用 **skiplist + dict**：dict 让 `ZSCORE` O(1)，跳表让范围查询和排名 O(log N)。
+
+**场景**：排行榜、延时队列（score 存执行时间戳）、按时间排序的 Feed、滑动窗口限流。
+
+## 5. 特殊类型
+
+### Bitmap（基于 String 的位操作）
+```
+SETBIT sign:u1:202610 30 1   # 10 月 31 日签到（偏移 30）
+GETBIT sign:u1:202610 30
+BITCOUNT sign:u1:202610      # 本月签到天数
+BITOP AND dest k1 k2
+BITPOS sign:u1:202610 1      # 第一次签到
+```
+最大 2^32 位（512 MB）。偏移量很大时 SETBIT 会一次性分配到该位置的内存，注意别用稀疏的大 ID 当偏移。
+
+### HyperLogLog：海量去重计数
+```
+PFADD uv:20261031 u1 u2 u3
+PFCOUNT uv:20261031
+PFMERGE uv:week uv:20261025 uv:20261026
+```
+每个 key 最多约 **12 KB**，标准误差约 **0.81%**，不能取出具体元素。适合 UV 统计。
+
+### Geo：地理位置
+```
+GEOADD shops 116.40 39.90 shopA
+GEOSEARCH shops FROMLONLAT 116.41 39.91 BYRADIUS 2 km ASC WITHDIST
+GEODIST shops shopA shopB km
+```
+底层就是 ZSet，score 是 52 位 geohash 编码。`GEOSEARCH`（6.2）取代了旧的 `GEORADIUS`。
+
+## 6. 如何选型
+
+| 需求 | 推荐 |
+|---|---|
+| 缓存一个对象 | String(JSON) 或 Hash |
+| 计数器 | String + INCR |
+| 队列 | List（简单）/ Stream（可靠） |
+| 去重、标签、共同好友 | Set |
+| 排行榜、延时任务 | ZSet |
+| 签到、在线状态 | Bitmap |
+| UV 估算 | HyperLogLog |
+| 附近的店 | Geo |
+''',
+quiz=[
+S(1,"要实现游戏积分排行榜（按分数从高到低取前 10 名），最合适的数据结构是？",["List","Set","Sorted Set","Hash"],2,r'''
+**Sorted Set** 按 score 自动排序，`ZADD`/`ZINCRBY` 更新分数是 O(log N)，`ZRANGE rank 0 9 REV WITHSCORES` 直接取 Top10。
+- List 只按插入顺序，不按分数排序，每次都要全量取出再排；
+- Set 无序；
+- Hash 能存分数，但无法按分数排序。''',hot=True),
+S(1,"`LPUSH q a b c` 执行后，`LRANGE q 0 -1` 返回？",["a b c","c b a","a c b","b c a"],1,r'''
+LPUSH 的多个元素是**从左到右依次插入到头部**：先插 a → [a]，再插 b → [b, a]，再插 c → [c, b, a]。所以结果是 `c b a`。若用 RPUSH 则是 `a b c`。'''),
+M(1,"以下哪些场景适合用 Set？（多选）",["文章标签去重","计算两个用户的共同关注","抽奖随机抽取中奖者","按时间顺序展示最近 100 条消息","记录点赞过某文章的用户（判断是否点过赞）"],[0,1,2,4],r'''
+- A：Set 自动去重；
+- B：`SINTER` 求交集；
+- C：`SPOP`（抽走不放回）/ `SRANDMEMBER`（不移除）；
+- E：`SADD` + `SISMEMBER` O(1) 判断。
+- D 错：Set **无序**，按时间顺序应使用 List（LPUSH + LTRIM）或以时间戳为 score 的 ZSet。'''),
+S(1,"HyperLogLog 适合下列哪个需求？",["统计网站每日独立访客数（允许约 1% 误差）","存储每个用户的访问记录明细","实现分布式锁","精确统计订单金额总和"],0,r'''
+HyperLogLog 用固定约 12 KB 内存估算基数，标准误差约 0.81%，非常适合海量 UV。
+- B：HLL 不能取出元素；
+- C：与锁无关；
+- D：金额需要精确值，用 INCRBYFLOAT 或数据库。''',hot=True),
+T(1,"`HGETALL` 是 O(1) 的命令，对任意大小的 Hash 使用都没有性能问题。",False,r'''
+**错误。** HGETALL 是 **O(N)**，N 是字段数。对几十万字段的 Hash 执行它会阻塞主线程并产生巨大的响应包。大 Hash 应该用 `HSCAN` 分批读取，或用 `HMGET` 只取需要的字段。'''),
+F(1,"写一条命令：把用户 bob 在 ZSet `rank` 中的分数增加 10。",["ZINCRBY rank 10 bob","ZADD rank INCR 10 bob"],r'''
+`ZINCRBY rank 10 bob`：成员不存在时以 0 为初值。也可以写 `ZADD rank INCR 10 bob`（INCR 模式下只能指定一个成员）。注意参数顺序是 **key、增量、成员**，常有人写成 `ZINCRBY rank bob 10` 而报错。'''),
+S(2,"小 Hash（字段少、值短）在 Redis 7+ 中默认使用哪种编码？",["ziplist","listpack","intset","skiplist"],1,r'''
+Redis 7.0 用 **listpack** 全面替代了 ziplist（ziplist 有"连锁更新"问题）。小 Hash、小 ZSet、小 List 节点都用 listpack。
+- A：ziplist 是 6.x 及之前的编码；旧配置名 `hash-max-ziplist-*` 仍作为别名兼容；
+- C：intset 只用于全是整数的小 Set；
+- D：skiplist 用于大的 ZSet。''',hot=True),
+S(2,"大 ZSet 底层使用 skiplist + dict 两个结构，dict 的作用是？",["让范围查询变成 O(1)","让按成员查分数（ZSCORE）变成 O(1)","节省内存","保证成员有序"],1,r'''
+dict 维护 **member → score** 的映射，所以 `ZSCORE`、判断成员是否存在都是 O(1)。跳表负责按分数排序，支撑 `ZRANGE`、`ZRANK` 这类 O(log N) 的操作。
+- A：范围查询靠跳表，是 O(log N + M)；
+- C：两个结构共享 member 对象，但 dict 本身是额外开销，不是为了省内存；
+- D：有序靠的是跳表。'''),
+S(2,"用 List 做消息队列（LPUSH + BRPOP）最大的缺陷是？",["性能太差","不支持阻塞读取","消费者取出消息后崩溃，消息就丢失了，没有 ACK 机制","消息无法保持顺序"],2,r'''
+BRPOP 取出即删除，消费者处理到一半崩溃就丢消息；也不支持消费组和多播。改进：
+- 用 `BLMOVE` 把消息移入"处理中"列表，处理完再 `LREM`，并有任务扫描超时消息；
+- 更好的方案是 **Stream**：消费组、ACK、Pending 列表、消息重新认领。
+A 错：List 两端操作 O(1)，很快；B 错：BRPOP 就是阻塞读；D 错：单队列内是 FIFO 有序的。''',hot=True),
+M(2,"关于 ZADD 的选项，正确的有？（多选）",["NX：只添加新成员，不更新已有成员","XX：只更新已有成员，不添加新成员","GT：只有新分数大于当前分数时才更新","CH：返回值改为新增加 + 分数被修改的成员总数","LIMIT：限制添加的成员数量"],[0,1,2,3],r'''
+A–D 都是 ZADD 的官方选项（GT/LT 在 6.2 加入）。GT 很适合"只保留历史最高分"的排行榜。
+E 错：`LIMIT` 是 `ZRANGE ... BYSCORE`/`ZRANGEBYSCORE` 的分页选项，不属于 ZADD。'''),
+S(2,"用 Bitmap 记录用户签到，`SETBIT sign:u1 1000000000 1` 会导致什么？",["只占用 1 bit","立即分配约 119 MB 内存，并可能阻塞","报错，偏移量超出范围","自动压缩成稀疏存储"],1,r'''
+Bitmap 底层是 String，SETBIT 会把字符串扩展到包含该偏移的长度：10 亿 bit ≈ 125,000,000 字节 ≈ **119 MB**，首次分配时还可能阻塞。
+- C 错：上限是 2^32 - 1，10 亿没有超；
+- D 错：Bitmap 不做稀疏压缩。
+所以不要用很大的、稀疏的用户 ID 直接当偏移，可先做 ID 映射或分片。'''),
+T(2,"Geo 类型底层其实是 Sorted Set，因此可以用 ZREM 删除一个地点。",True,r'''
+**正确。** GEOADD 把经纬度编码为 52 位 geohash 作为 score 存入 ZSet，Redis 没有提供 GEODEL，删除直接用 `ZREM shops shopA`；也可以用 `ZRANGE`、`ZCARD` 查看所有地点和数量。'''),
+F(2,"写出一条 6.2+ 的命令：从 ZSet `rank` 中按分数从高到低取前 3 名并带上分数。",["ZRANGE rank 0 2 REV WITHSCORES","ZREVRANGE rank 0 2 WITHSCORES"],r'''
+6.2 起推荐统一语法 `ZRANGE rank 0 2 REV WITHSCORES`；旧写法 `ZREVRANGE rank 0 2 WITHSCORES` 依然可用但已标记为 deprecated。下标从 0 开始，`0 2` 表示前 3 个。'''),
+S(3,"Set 中保存的全是整数且数量很少时使用 intset 编码。如果执行 `SADD` 插入一个字符串 `\"abc\"`，会怎样？",["报错，intset 不能存字符串","编码转换为 listpack 或 hashtable，插入成功","字符串被转成 0 存入","整个 Set 被清空"],1,r'''
+编码转换对使用者透明：一旦插入非整数元素（或数量超过 `set-max-intset-entries`，默认 512），Redis 会把集合转换为 listpack（7.2+，元素少且短时）或 hashtable。**编码只会升级不会自动降级**。其他选项都不会发生。'''),
+S(3,"关于 HyperLogLog，下列说法错误的是？",["PFCOUNT 返回的是近似值","PFMERGE 可以合并多个 HLL 求并集基数","可以用 PFCOUNT 判断某个元素是否已经添加过","基数很小时使用稀疏编码，占用远小于 12 KB"],2,r'''
+C 错误：HLL 只保存寄存器统计信息，**不能判断某个元素是否存在**，也取不出元素。判断"是否存在"应用 Set（精确）或布隆过滤器（`BF.ADD`/`BF.EXISTS`，Redis 8 内置）。
+A、B、D 正确：近似值；PFMERGE 求并集；小基数时用 sparse 编码，变大后转为 dense（约 12 KB）。'''),
+],
+bank=[
+B(1,"Redis 有哪些数据类型？分别适合什么场景？",r'''
+| 类型 | 特点 | 场景 |
+|---|---|---|
+| String | 二进制安全，≤512MB，支持计数 | 缓存、计数器、分布式锁、Session |
+| Hash | field-value 映射 | 对象属性、购物车 |
+| List | 有序可重复，两端 O(1) | 简单队列、最新列表 |
+| Set | 无序去重，集合运算 | 标签、共同好友、抽奖 |
+| Sorted Set | 按 score 排序 | 排行榜、延时队列、滑动窗口 |
+| Stream | 追加日志 + 消费组 | 可靠消息队列、事件流 |
+| Bitmap | 位操作 | 签到、在线状态、布尔标记 |
+| HyperLogLog | 12KB 基数估算 | UV |
+| Geo | 基于 ZSet 的经纬度 | 附近的人/店 |
+
+Redis 8 还内置了 JSON、Search（查询引擎/向量检索）、Time Series、Bloom/Cuckoo/Count-Min/Top-K/t-digest 以及 Vector Set。''',hot=True),
+B(2,"ZSet 为什么用跳表而不用红黑树或 B+ 树？",r'''
+1. **范围查询简单高效**：找到起点后沿底层链表顺序遍历即可，ZRANGEBYSCORE 天然 O(log N + M)；红黑树要做中序遍历，实现更复杂；
+2. **实现简单**：代码量小、容易调试，插入删除只需修改局部指针，不需要旋转；
+3. **内存可调**：每个节点平均层数由概率 p 决定（Redis 中 p = 1/4，最高 32 层），平均每节点约 1.33 个指针，比平衡树更省；
+4. 数据在内存中，B+ 树"减少磁盘 I/O"的优势用不上。
+
+Redis 作者 antirez 本人给出的理由也正是：内存占用可调、范围操作友好、实现与调试简单。''',r'''
+Redis 跳表的增强：每个节点保存 **span（跨度）**，查找时累加 span 就能得到排名，所以 `ZRANK` 也是 O(log N)；底层有 backward 指针，支持反向遍历（`REV`）；另外配合 dict 实现 O(1) 的 ZSCORE。''',hot=True),
+B(2,"listpack 是什么？为什么替代了 ziplist？",r'''
+两者都是**连续内存的紧凑列表**，用于小 Hash、小 ZSet、List 节点等，省去指针和对象头，大幅省内存。
+
+ziplist 的问题在于每个 entry 记录了**前一个 entry 的长度**（prevlen，1 或 5 字节）。当某个 entry 长度从 253 以下变成 254 以上时，后一个 entry 的 prevlen 要从 1 字节扩为 5 字节，这可能导致它自己也越过阈值，引发**连锁更新**，最坏 O(N²)。
+
+listpack 每个 entry 只记录**自己的长度**（放在 entry 尾部用于反向遍历），彻底消除连锁更新。7.0 起全面替换 ziplist。''',hot=True),
+B(2,"Hash 存对象和 String 存 JSON 怎么选？",r'''
+**选 Hash**：字段经常单独更新（如计数字段 `HINCRBY`）、只需读取部分字段、字段数量适中（能用 listpack 编码时非常省内存）。7.4+ 还能给单个字段设置过期。
+
+**选 String(JSON)**：对象总是整体读写；有嵌套结构；需要整体过期；与其他语言/系统共享序列化格式。
+
+**选 Redis JSON（8.0 内置）**：需要对嵌套 JSON 做路径级读写（`JSON.SET doc $.a.b 1`）或配合查询引擎做二级索引。
+
+注意别把几十万字段塞进一个 Hash——那会成为大 key。'''),
+B(2,"如何用 Redis 实现一个延时队列？",r'''
+**ZSet 方案**：score 存"应执行的时间戳"。
+```
+ZADD delay:q 1730340000 task:1
+# 消费者轮询：
+ZRANGE delay:q -inf <now> BYSCORE LIMIT 0 10
+ZREM delay:q task:1    # 返回 1 表示抢到，返回 0 说明被别人抢走
+```
+多个消费者并发时，必须以 `ZREM` 的返回值判断是否抢到，或者用 Lua 把"查询 + 删除"原子化。
+
+要点：轮询间隔与精度的平衡；抢到后处理失败需要重新放回；任务量巨大时按时间分片多个 key。更可靠的方案是使用专门的 MQ（RocketMQ 延时消息等）或 Stream + ZSet 组合。''',hot=True),
+B(2,"如何用 Redis 实现「最新动态（Timeline）」和「共同关注」？",r'''
+**Timeline**：
+- 用 List：`LPUSH feed:u1 postId` + `LTRIM feed:u1 0 999` 保留最近 1000 条，`LRANGE feed:u1 0 19` 分页；
+- 需要按时间区间翻页、防止新数据插入导致翻页重复时，用 ZSet（score = 时间戳）配合 `ZRANGE ... BYSCORE REV LIMIT` 做游标分页。
+
+**共同关注**：每个用户一个 Set：`SINTER follow:u1 follow:u2`；只要数量时用 `SINTERCARD`（7.0）；"我关注的人也关注了他"可以用 `SISMEMBER` 判断。大 V 关注列表很大时，交集计算是 O(N*M) 级别，应放到从库或离线计算。'''),
+B(2,"Bitmap 能做什么？用它统计连续签到天数怎么做？",r'''
+Bitmap 用一位表示一个布尔状态，1 亿用户的"今日是否活跃"只需约 12 MB。
+
+签到：key 为 `sign:{uid}:{yyyyMM}`，偏移为日期 - 1：
+```
+SETBIT sign:1001:202610 30 1
+BITCOUNT sign:1001:202610          # 当月签到天数
+BITFIELD sign:1001:202610 GET u31 0   # 一次取出整月 31 位
+```
+连续签到：用 BITFIELD 取出本月到今天的位，在应用层从今天向前数连续的 1。
+统计"10 月 31 日所有活跃用户"：key 为 `active:20261031`，偏移为 uid；`BITOP AND` 可以求连续多天都活跃的用户。'''),
+B(3,"Redis 7.4 / 8.0 新增的 Hash 字段过期怎么用？适合什么场景？",r'''
+以前只能对整个 key 设置 TTL；7.4 起可以对 Hash 的**单个字段**设置过期：
+```
+HSET session:u1 token abc device ios
+HEXPIRE session:u1 3600 FIELDS 1 token
+HTTL session:u1 FIELDS 1 token
+HPERSIST session:u1 FIELDS 1 token
+```
+8.0 新增 `HSETEX`（写入并设置字段过期）、`HGETEX`（读取并修改字段过期）、`HGETDEL`（读取并删除字段）。
+
+场景：一个用户多个设备的登录令牌、每个字段独立失效的特征开关、购物车中限时商品。以前要么拆成很多 key，要么在 value 里存时间戳自己判断。'''),
+B(3,"什么是 quicklist？为什么 List 不直接用双向链表？",r'''
+普通双向链表每个节点要两个指针（16 字节）加对象头，存小字符串时元数据比数据还大，而且节点分散，缓存命中率低。
+
+quicklist = **双向链表 + 每个节点是一个 listpack**：
+- 节点内部是连续内存，省空间、缓存友好；
+- 节点之间用链表连接，头尾插入仍是 O(1)，避免了单个大 listpack 插入时整体 realloc 的代价；
+- `list-max-listpack-size`（默认 -2，每节点 ≤ 8KB）控制节点大小；
+- `list-compress-depth` 可以对中间节点做 LZF 压缩（两端节点不压缩，因为最常访问）。'''),
+B(3,"Redis 8 新增了哪些数据类型 / 能力？",r'''
+Redis 8.0 把以前 Redis Stack 中的模块直接合并进开源版：
+- **JSON**：`JSON.SET/GET`，按 JSONPath 读写嵌套文档；
+- **Redis Query Engine（Search）**：对 Hash/JSON 建二级索引，支持全文检索、数值/标签过滤、聚合，以及**向量相似度搜索**；
+- **Time Series**：时间序列写入、降采样、聚合查询；
+- **概率数据结构**：Bloom、Cuckoo、Count-Min Sketch、Top-K、t-digest；
+- **Vector Set**（8.0 beta 推出）：`VADD`、`VSIM`，类似 ZSet 但元素是向量，用于语义检索、推荐。
+
+此外还有 Hash 字段过期新命令、性能（大量命令延迟下降、新 I/O 线程实现）和复制改进。学习时先掌握经典结构，再按需深入这些新能力。'''),
+B(3,"布隆过滤器的原理是什么？Redis 中怎么用？",r'''
+布隆过滤器用一个 m 位的位数组和 k 个哈希函数：添加元素时把 k 个位置设为 1；查询时如果 k 个位置都是 1 则"**可能存在**"，只要有一个是 0 则"**一定不存在**"。
+特点：空间极省；**有误判（假阳性）无漏判**；标准实现不支持删除（Cuckoo Filter 支持）。
+
+Redis 8 内置：
+```
+BF.RESERVE bf:user 0.001 10000000   # 误判率 0.1%，容量 1000 万
+BF.ADD bf:user 1001
+BF.EXISTS bf:user 1001
+BF.MADD / BF.MEXISTS
+```
+最经典的用途是防**缓存穿透**：请求的 ID 若一定不存在，直接拒绝，不查 DB。''',hot=True),
+B(3,"如何用 Redis 实现「附近的人」？有什么局限？",r'''
+```
+GEOADD loc:users 116.397 39.908 u1
+GEOSEARCH loc:users FROMMEMBER u1 BYRADIUS 5 km ASC COUNT 20 WITHDIST
+```
+原理：经纬度编码为 52 位 geohash 作为 ZSet 的 score，geohash 前缀相同的点空间上相邻，查询时计算目标点周围的 9 个格子做范围扫描，再精确算距离过滤。
+
+局限：
+- 单个 key 存全量用户会变成大 key，应按城市/区域分片；
+- 位置更新频繁时写压力大；
+- 只能做圆形或矩形范围，复杂多边形、按其他条件过滤要配合查询引擎或专用 GIS（如 PostGIS）。'''),
+])

@@ -1,0 +1,301 @@
+from h import *
+CH = dict(id="core", code="CORE", stage=2, name="核心机制：过期、持久化、事务与 Lua",
+desc="过期删除策略、RDB/AOF 与 fork/COW、MULTI/WATCH、Pipeline、Lua 与 Functions、线程模型。",
+lesson=r'''
+## 1. 过期（TTL）是怎么删除的
+
+```
+EXPIRE k 60          # 秒；PEXPIRE 毫秒
+EXPIREAT k 1730390400
+EXPIRE k 60 NX       # 7.0+：仅当没有 TTL 时设置；还有 XX / GT / LT
+TTL k / PTTL k
+PERSIST k
+EXPIRETIME k         # 7.0+：返回绝对过期时间戳
+```
+
+Redis 用两种策略配合删除过期 key：
+1. **惰性删除**：访问 key 时检查是否过期，过期就删除并当作不存在；
+2. **定期删除**：后台任务（频率由 `hz` 控制，默认 10 次/秒）每次从设置了过期的 key 中**随机抽样**（默认 20 个），删除其中过期的；如果过期比例超过 25% 就继续抽样，并有时间上限，避免阻塞。
+
+所以"过期的 key 不一定立刻释放内存"。如果内存仍不够，就要靠 **maxmemory 淘汰策略**（第 6 章）。
+
+主从复制下，**从库不会主动删除过期 key**，而是等待主库同步过来的 DEL；但从 3.2 起，从库读取已逻辑过期的 key 会返回空，避免读到脏数据。
+
+**避免集体过期**：批量写入缓存时给 TTL 加随机抖动，如 `3600 + rand(0, 300)`，防止同一时刻大量 key 失效引发缓存雪崩。
+
+## 2. 持久化：RDB 与 AOF
+
+### RDB（快照）
+在某个时间点把内存数据整体写成一个压缩的二进制文件 `dump.rdb`。
+- 触发：配置 `save 3600 1 300 100 60 10000`（N 秒内至少 M 次修改）、手动 `BGSAVE`、主从全量同步、`SHUTDOWN` 时；
+- `SAVE` 在主线程执行，会**阻塞**；`BGSAVE` **fork 子进程**写文件，主进程继续服务；
+- 优点：文件紧凑、恢复快、适合备份；缺点：两次快照之间的数据会丢失，fork 有成本。
+
+### AOF（追加日志）
+把每条写命令追加到日志，重启时重放。
+- `appendonly yes` 开启；`appendfsync` 三档：`always`（每条都 fsync，最安全最慢）、**`everysec`（默认，最多丢约 1 秒）**、`no`（交给操作系统，约 30 秒）；
+- 日志会越来越大，需要 **AOF 重写**（`BGREWRITEAOF` 或按 `auto-aof-rewrite-percentage/min-size` 自动触发）：fork 子进程根据当前内存数据生成最精简的命令集，而不是去分析旧文件；
+- 7.0 起是 **Multi-Part AOF**：`appenddirname` 目录下有 base 文件、incr 增量文件和 manifest 清单，重写期间新命令直接写新的 incr 文件，不再需要内存中的重写缓冲；
+- `aof-use-rdb-preamble yes`（默认）：base 文件用 RDB 格式，兼顾加载速度和数据安全（混合持久化）。
+
+| | RDB | AOF |
+|---|---|---|
+| 丢数据 | 最后一次快照之后的 | everysec 下约 1 秒 |
+| 文件 | 小、紧凑 | 较大 |
+| 恢复速度 | 快 | 较慢（混合模式改善很多） |
+| 开销 | fork | 持续写盘 + 重写 fork |
+
+**建议**：对数据安全有要求时同时开启 RDB + AOF（everysec）；纯缓存可以只开 RDB 甚至都关闭。两者都开时，重启**优先加载 AOF**。
+
+### fork 与写时复制（COW）
+BGSAVE / AOF 重写都要 `fork()`。fork 需要复制父进程的**页表**，内存 20 GB 的实例页表可能有几十 MB，fork 本身就会阻塞主线程几十到几百毫秒（`INFO stats` 的 `latest_fork_usec` 可查）。
+
+fork 后父子进程共享物理内存页，父进程**写**某页时内核才复制该页（Copy-On-Write）。写入越多，额外内存越多，最坏接近翻倍。所以：
+- 单实例内存不宜过大（常见建议 ≤ 10~20 GB）；
+- 关闭透明大页（THP），否则一次写入就复制 2MB 的大页；
+- 设置 `vm.overcommit_memory = 1`，避免 fork 因内存检查失败；
+- 避免在写高峰做 BGSAVE。
+
+## 3. 事务：MULTI / EXEC / WATCH
+
+```
+MULTI
+DECRBY stock:1 1
+LPUSH orders:u1 o-1001
+EXEC
+```
+- MULTI 之后的命令**入队**（返回 QUEUED），EXEC 时**按顺序一次性执行**，执行期间不会插入其他客户端的命令（隔离性）；
+- **没有回滚**：入队阶段有语法错误（命令不存在、参数个数错）→ EXEC 直接拒绝整个事务；执行阶段出错（比如对 String 执行 LPUSH）→ **只有这条失败，其他命令照常执行**；
+- `DISCARD` 放弃事务；
+- `WATCH k`：乐观锁。EXEC 前如果被 WATCH 的 key 被其他客户端修改，EXEC 返回 nil，整个事务不执行，客户端重试即可。
+
+```
+WATCH balance:u1
+GET balance:u1         # 读到 100
+MULTI
+DECRBY balance:u1 30
+EXEC                   # 若期间 balance 被改过，返回 (nil)
+```
+
+## 4. Pipeline
+
+Pipeline 是**客户端**技术：把多条命令一次性发给服务器，再一次性读取结果，减少网络往返（RTT）。1000 条命令在 1ms RTT 下从约 1 秒降到几毫秒。
+- **不是原子的**：中间可以穿插其他客户端的命令；
+- 单批不宜过大（如几百到几千条一批），否则服务端要缓存大量回复；
+- Cluster 下客户端需要按槽位把命令拆分到不同节点。
+
+## 5. Lua 脚本与 Functions
+
+Lua 脚本在服务器端**原子执行**，执行期间不会有别的命令插入，非常适合"读 → 判断 → 写"。
+
+```
+EVAL "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end" 1 lock:1 token-abc
+```
+- `KEYS` 与 `ARGV` 分开传：Cluster 依赖 KEYS 判断槽位，脚本中访问的所有 key 都应通过 KEYS 传入且在同一槽；
+- `SCRIPT LOAD` 返回 SHA1，之后用 `EVALSHA` 只传摘要省带宽；
+- 脚本超过 `busy-reply-threshold`（旧名 lua-time-limit，默认 5 秒）后，其他客户端会收到 BUSY 错误；脚本还**没有写入**时可以 `SCRIPT KILL`，已经写过数据就只能 `SHUTDOWN NOSAVE`——所以脚本必须短小；
+- 脚本出错时，已执行的写操作**不会回滚**。
+
+**Functions（7.0+）**：把脚本作为库持久化到服务器（随 RDB/AOF 保存，也会复制到从库），用名字调用：
+```
+FUNCTION LOAD "#!lua name=mylib
+redis.register_function('incr_if_lt', function(keys, args)
+  local v = tonumber(redis.call('GET', keys[1]) or '0')
+  if v < tonumber(args[1]) then return redis.call('INCR', keys[1]) end
+  return -1
+end)"
+FCALL incr_if_lt 1 counter 100
+```
+
+## 6. 线程模型小结
+
+- 主线程：接收命令、执行命令、返回结果（命令执行永远串行）；
+- I/O 线程（`io-threads`）：并行读写 socket；
+- 后台线程（bio）：关闭文件、AOF fsync、lazyfree 释放内存；
+- 子进程：RDB、AOF 重写。
+
+理解了这一点，就能明白为什么一个慢命令会拖慢所有请求，以及为什么 Redis 命令天然是原子的。
+''',
+quiz=[
+S(1,"Redis 删除过期 key 采用的策略是？",["只有定时删除：每个 key 到期时精确触发删除","惰性删除 + 定期抽样删除","只在内存满时删除","只有惰性删除"],1,r'''
+Redis 组合使用两种策略：访问时检查的**惰性删除**，以及后台任务**随机抽样**的定期删除。
+- A：为每个 key 建定时器开销太大，Redis 没有这样做；
+- C：内存满时是 **maxmemory 淘汰**，与过期删除是两套机制；
+- D：只有惰性删除的话，不再被访问的过期 key 会一直占内存。''',hot=True),
+S(1,"AOF 的 `appendfsync` 默认值以及它在宕机时大约丢失多少数据？",["always，不丢数据","everysec，最多丢约 1 秒的数据","no，最多丢约 1 秒","everysec，不丢数据"],1,r'''
+默认 **everysec**：后台线程每秒 fsync 一次，宕机最多丢失约 1 秒（极端情况下 fsync 阻塞时可能约 2 秒）的写入。
+- always 每条命令都 fsync，性能差，但也不是"绝对不丢"（磁盘故障等）；且不是默认值；
+- no 由操作系统决定刷盘时机（Linux 一般约 30 秒）。''',hot=True),
+T(1,"`SAVE` 和 `BGSAVE` 都会 fork 子进程生成 RDB，主线程不受影响。",False,r'''
+**错误。** `SAVE` 在**主线程**中同步生成 RDB，期间阻塞所有客户端，生产环境不要用。`BGSAVE` 才是 fork 子进程在后台写文件（fork 这一瞬间仍会短暂阻塞主线程）。'''),
+S(1,"下列关于 Redis 事务（MULTI/EXEC）的说法，正确的是？",["执行过程中某条命令出错，已执行的命令会自动回滚","EXEC 执行期间不会穿插执行其他客户端的命令","MULTI 之后的命令会立即执行并返回结果","Redis 事务完全满足 ACID"],1,r'''
+B 正确：EXEC 时队列中的命令被连续执行，这是 Redis 事务提供的**隔离性**保证。
+- A 错：Redis **不支持回滚**，运行期出错的命令失败，其余命令依然执行；
+- C 错：命令只是入队，返回 QUEUED；
+- D 错：没有回滚（原子性不完整），持久性取决于持久化配置。''',hot=True),
+F(1,"写出触发后台 AOF 重写的命令。",["BGREWRITEAOF"],r'''
+`BGREWRITEAOF` fork 子进程，根据**当前内存数据**生成最精简的命令集作为新的 base 文件（混合模式下是 RDB 格式），而不是去读旧 AOF 文件做合并。例如对一个计数器 INCR 了 100 万次，重写后只剩一条 `SET counter 1000000`。'''),
+S(2,"同时开启了 RDB 和 AOF，Redis 重启时如何加载数据？",["优先加载 RDB","优先加载 AOF","两个都加载再合并","随机选择一个"],1,r'''
+AOF 通常比 RDB 更完整（丢失更少），所以同时开启时**只加载 AOF**。这也是一个常见坑：线上原本只有 RDB，直接把配置改成 `appendonly yes` 再重启，会加载一个空的 AOF 导致数据"消失"。正确做法是先在运行时执行 `CONFIG SET appendonly yes`，等 AOF 生成完毕后再修改配置文件。''',hot=True),
+S(2,"事务中入队了 `SET a 1`、`LPUSH a x`、`SET b 2`，然后 EXEC。结果是？",["三条全部失败","三条全部成功","SET a 1 和 SET b 2 成功，LPUSH 返回 WRONGTYPE 错误","EXEC 返回 EXECABORT"],2,r'''
+`LPUSH a x` 语法正确，可以入队，但执行时 a 是 String，所以运行期报 WRONGTYPE。Redis 事务不回滚，其他两条照常执行。
+- D 的 EXECABORT 发生在**入队阶段**就能发现的错误（命令不存在、参数个数错误）。''',hot=True),
+S(2,"使用 `WATCH k` 之后，EXEC 返回 nil（空回复），说明？",["事务执行成功但没有返回值","在 WATCH 之后、EXEC 之前，k 被修改了，事务未执行","k 不存在","Redis 宕机"],1,r'''
+WATCH 实现的是**乐观锁 / CAS**：EXEC 时如果被监视的 key 已被修改（例如被其他客户端写入或删除），事务被放弃，EXEC 返回 null，客户端需要重新读取并重试。EXEC 或 DISCARD 之后，所有 WATCH 自动取消。'''),
+M(2,"关于 Pipeline，正确的有？（多选）",["能显著减少网络往返次数","Pipeline 中的命令是原子执行的","需要客户端支持","一次 Pipeline 发送的命令越多越好，没有上限顾虑","在 Cluster 中需要按 key 所在节点拆分"],[0,2,4],r'''
+- A 正确：核心价值就是减少 RTT；
+- C 正确：Pipeline 是客户端打包发送 + 批量读取回复，协议本身天然支持；
+- E 正确：不同槽可能在不同节点，客户端要分组发送。
+- B 错：Pipeline 不是原子的，其他客户端的命令可以插在中间；需要原子性请用 MULTI 或 Lua；
+- D 错：批次过大时服务端要缓存全部回复，占用内存与输出缓冲，一般几百到几千条一批。'''),
+S(2,"Lua 脚本执行超时后，若脚本**已经执行过写命令**，应该怎么处理？",["SCRIPT KILL","SHUTDOWN NOSAVE","等待其自动回滚","CLIENT KILL 该客户端"],1,r'''
+为了保证脚本原子性，脚本一旦写过数据就**不能被 SCRIPT KILL 中断**（否则会留下"执行了一半"的状态），只能 `SHUTDOWN NOSAVE` 停机（不保存当前内存，避免把半成品写入 RDB）。
+- A：只对尚未写入的脚本有效；
+- C：Redis 不会回滚；
+- D：杀掉连接不会停止正在执行的脚本。
+所以 Lua 脚本一定要短小，避免循环处理大量数据。'''),
+T(2,"在 Redis Cluster 中，Lua 脚本里可以在代码中拼接 key 名称并访问，不需要通过 KEYS 参数传入。",False,r'''
+**错误（不推荐，且常常会失败）。** Cluster 根据 `KEYS` 参数计算槽位，把脚本路由到对应节点；如果在脚本中动态拼接一个落在其他槽的 key，会报跨槽或不属于本节点的错误。规范做法：**所有 key 都通过 KEYS 传入**，并用 Hash Tag 确保它们在同一个槽。'''),
+S(3,"一个使用 40 GB 内存的实例，执行 BGSAVE 时出现主线程卡顿数百毫秒，最可能的原因是？",["子进程写磁盘占用了主线程","fork 时需要复制大量页表，fork 调用本身阻塞了主线程","RDB 压缩算法太慢","网络带宽不足"],1,r'''
+fork 需要复制父进程的页表，40 GB 内存对应的页表在 4KB 页下约 80 MB，复制耗时可达数百毫秒，期间主线程阻塞。可以从 `INFO stats` 的 `latest_fork_usec` 看到。
+- A：写盘发生在子进程，不占主线程；
+- C：压缩在子进程中进行；
+- D 与 BGSAVE 无关。
+缓解：控制单实例内存、关闭 THP、使用物理机或支持快速 fork 的虚拟化、在从库做持久化。''',hot=True),
+S(3,"为什么部署 Redis 时通常建议关闭透明大页（THP）？",["THP 会让 Redis 无法使用超过 4GB 的内存","开启 THP 后，fork 后的写时复制以 2MB 为单位复制页面，导致内存暴涨和延迟抖动","THP 会让 AOF 无法写盘","THP 会关闭 I/O 多路复用"],1,r'''
+COW 的复制粒度是页。THP 开启时页大小是 2MB，父进程即使只修改 1 个字节，也要复制整个 2MB 大页，BGSAVE/AOF 重写期间内存与延迟都会显著上升。Redis 启动日志也会对此发出警告。其他选项都不是 THP 的影响。'''),
+F(3,"7.0+ 中，只在 key **当前没有过期时间**时才为它设置 60 秒过期，写出命令。",["EXPIRE k 60 NX"],r'''
+`EXPIRE k 60 NX`。7.0 为 EXPIRE 系列增加了选项：
+- `NX`：没有过期时间时才设置；
+- `XX`：已有过期时间时才设置；
+- `GT`：新的过期时间大于当前值才设置（不存在 TTL 视为无限大）；
+- `LT`：新的过期时间更小才设置。
+典型用法：计数器第一次 INCR 后设置窗口过期，避免每次 INCR 都把 TTL 往后推。'''),
+T(3,"在主从架构中，从库会自己扫描并删除过期的 key。",False,r'''
+**错误。** 为了保证主从一致，从库**不会主动删除**过期 key，而是等待主库在删除时通过复制流发送的 `DEL`/`UNLINK`。不过从 3.2 起，从库在读取已逻辑过期的 key 时会返回"不存在"，所以客户端读从库不会读到过期数据。（可写从库上自己写入的带 TTL 的 key 是例外，会由从库自行处理。）'''),
+],
+bank=[
+B(1,"RDB 和 AOF 有什么区别？生产环境怎么选？",r'''
+| | RDB | AOF |
+|---|---|---|
+| 原理 | 定时把内存快照写成二进制文件 | 追加记录每条写命令 |
+| 数据安全 | 丢失最后一次快照后的全部修改 | everysec 下最多丢约 1 秒 |
+| 文件体积 | 小、压缩 | 大，需要重写 |
+| 恢复速度 | 快 | 慢（混合持久化后改善） |
+| 性能影响 | fork 开销 | 持续写盘 + 重写时 fork |
+
+选型：
+- **纯缓存**（丢了可以从 DB 重建）：只开 RDB 或都不开；
+- **对数据有要求**：RDB + AOF everysec，并开启 `aof-use-rdb-preamble`（混合持久化）；
+- 定期把 RDB 拷贝到异地做冷备；
+- 大实例可以在**从库**上做持久化，减轻主库压力。''',r'''
+注意：Redis 的持久化是"尽力而为"，无论如何配置都可能丢失少量数据（异步复制 + fsync 窗口）。把 Redis 当唯一真相源存储资金类数据是危险的。''',hot=True),
+B(2,"BGSAVE 的完整流程是怎样的？什么是写时复制？",r'''
+1. 主线程收到 BGSAVE，检查是否已有子进程在执行；
+2. 调用 `fork()` 创建子进程（这一步复制页表，会**阻塞主线程**）；
+3. 子进程遍历内存数据，写入临时 RDB 文件，写完后原子 rename 替换旧文件；
+4. 主线程继续处理请求，子进程结束后通知主线程更新统计信息。
+
+**写时复制（COW）**：fork 后父子进程共享同一份物理内存页，只把页标记为只读。父进程要修改某页时触发缺页中断，内核复制这一页给父进程单独使用。因此子进程看到的始终是 fork 那一刻的快照，而额外内存只与 BGSAVE 期间**被修改的页数量**有关。''',r'''
+监控项：`INFO persistence` 的 `rdb_last_cow_size`、`aof_last_cow_size` 可以看到上次持久化额外复制了多少内存；`INFO stats` 的 `latest_fork_usec` 是上次 fork 耗时。写多读少的大实例 COW 可能接近整个数据集大小，所以 maxmemory 要给 COW 预留空间（常见做法是物理内存的 50%~70%）。''',hot=True),
+B(2,"AOF 重写是怎么实现的？7.0 的 Multi-Part AOF 解决了什么问题？",r'''
+**目的**：AOF 记录了所有历史命令，会无限增长且包含大量冗余（同一 key 多次修改）。重写会根据当前内存生成最精简的命令集。
+
+**7.0 之前**：fork 子进程写新 AOF；重写期间主进程的新命令既写入旧 AOF，又写入内存中的 **AOF 重写缓冲区**；子进程完成后，主进程把缓冲区的内容追加到新文件并替换。问题：重写缓冲区占内存，最后追加阶段可能阻塞主线程，并且同一命令要写两次磁盘。
+
+**7.0 Multi-Part AOF**：AOF 拆成 base（重写生成的快照，默认 RDB 格式）+ 若干 incr（增量命令）+ manifest（清单）。重写开始时主进程直接打开一个**新的 incr 文件**接收新命令；子进程只负责生成新的 base；完成后更新 manifest，删除旧的 base 和 incr。去掉了重写缓冲区和双写。''',hot=True),
+B(1,"Redis 事务支持回滚吗？为什么这样设计？",r'''
+**不支持。** 两类错误：
+1. **入队错误**（命令不存在、参数个数错误）：EXEC 时返回 EXECABORT，整个事务都不执行；
+2. **执行错误**（对错误类型的 key 操作等）：只有出错的命令失败，其余正常执行，不回滚。
+
+设计理由（官方文档）：执行期错误基本都是**编程错误**（比如对 String 用了 List 命令），应该在开发阶段发现；不支持回滚可以让 Redis 保持简单和高性能。
+
+如果需要"要么全部成功要么都不执行"的条件逻辑，用 **Lua 脚本**先检查再写；但要注意 Lua 中途报错同样不会回滚已执行的写入。''',hot=True),
+B(2,"WATCH 是怎么实现乐观锁的？用它实现一个安全的扣余额。",r'''
+WATCH 会在服务器上记录"这个客户端监视了哪些 key"。任何对这些 key 的修改都会把监视它的客户端标记为 dirty；EXEC 时如果 dirty，就拒绝执行并返回 null。
+
+```
+WATCH balance:u1
+val = GET balance:u1
+if val < 30: UNWATCH; return 余额不足
+MULTI
+DECRBY balance:u1 30
+EXEC        -> nil 则重试（可限制重试次数）
+```
+适合冲突较少的场景；高冲突下大量重试会浪费资源，此时直接用 Lua 更简单：
+```
+local v = tonumber(redis.call('GET', KEYS[1]) or '0')
+if v < tonumber(ARGV[1]) then return -1 end
+return redis.call('DECRBY', KEYS[1], ARGV[1])
+```'''),
+B(1,"Pipeline、事务、Lua 脚本有什么区别？",r'''
+| | Pipeline | MULTI/EXEC | Lua / Function |
+|---|---|---|---|
+| 减少 RTT | ✅ | 配合 Pipeline 时 ✅ | ✅（一次调用） |
+| 原子性（不被插队） | ❌ | ✅ | ✅ |
+| 命令之间能否依赖结果 | ❌ | ❌（入队时拿不到结果） | ✅（可读后判断再写） |
+| 出错回滚 | ❌ | ❌ | ❌ |
+| 风险 | 批次过大占内存 | 无 | 脚本过长阻塞整个实例 |
+
+经验：纯批量读写用 Pipeline；需要隔离但无条件判断用 MULTI；"读-判断-写"用 Lua。''',hot=True),
+B(2,"Lua 脚本使用有哪些注意事项？",r'''
+1. **短小**：执行期间阻塞所有命令，不要在脚本里循环处理大量数据；
+2. **key 通过 KEYS 传入**，并在 Cluster 下保证同槽（Hash Tag）；
+3. 使用 `SCRIPT LOAD` + `EVALSHA` 减少传输；收到 NOSCRIPT 错误时回退到 EVAL（大多数客户端自动处理）；
+4. 脚本应是**确定性**的：5.0 起默认以"效果复制"方式把脚本产生的写命令复制给从库/AOF，但仍建议避免依赖随机数和时间；
+5. 不回滚：先检查所有条件，再执行写入；
+6. 超时：超过 `busy-reply-threshold` 后其他请求收到 BUSY；未写入可 `SCRIPT KILL`，已写入只能 `SHUTDOWN NOSAVE`；
+7. 7.0+ 推荐使用 **Functions** 管理常用逻辑，函数随数据持久化和复制，不会因重启丢失。'''),
+B(2,"过期 key 的删除策略是什么？为什么过期了内存却没降？",r'''
+**惰性删除**：每次访问 key 时检查过期时间，过期则删除。
+**定期删除**：`serverCron` 按 `hz`（默认 10）频率执行主动过期循环：每轮随机抽取 20 个带过期时间的 key，删除过期的；若过期比例 > 25% 就继续，直到比例下降或用完时间片（默认约 CPU 时间的 25%）。`active-expire-effort`（1~10）可以调整积极程度。
+
+内存没降的原因：
+- 过期 key 还没被抽到或访问到；
+- 删除后内存归还给 jemalloc，但 RSS 不一定下降（**内存碎片**），看 `mem_fragmentation_ratio`，可开启 `activedefrag`；
+- 从库要等主库同步 DEL。''',hot=True),
+B(3,"fork 有哪些坑？大内存实例如何降低持久化带来的影响？",r'''
+坑：
+1. fork 复制页表阻塞主线程（大实例可达数百毫秒）；
+2. COW 导致额外内存，写多时最坏接近翻倍，可能触发 OOM Killer；
+3. THP 开启时 COW 粒度变成 2MB，问题放大；
+4. `vm.overcommit_memory=0` 时内核可能拒绝 fork，日志出现 "Can't save in background: fork: Cannot allocate memory"。
+
+对策：
+- 单实例内存控制在 10~20 GB 内，用 Cluster 水平拆分；
+- 关闭 THP，`vm.overcommit_memory=1`；
+- maxmemory 预留 COW 空间；
+- 在从库上做 RDB / AOF 重写，主库关闭或减少持久化；
+- 错开业务高峰执行 BGSAVE；监控 `latest_fork_usec`、`rdb_last_cow_size`。''',hot=True),
+B(3,"Redis 是单线程的吗？6.0 的多线程和 8.0 的改进分别是什么？",r'''
+准确说法：**命令执行是单线程的**，Redis 进程本身是多线程的。
+- 4.0：引入 lazyfree 后台线程（UNLINK、FLUSHALL ASYNC）；
+- 6.0：引入 **I/O 线程**（`io-threads N`），网络读写、协议解析可以多线程并行，命令执行仍在主线程，所以不需要给数据结构加锁；
+- 8.0：重新实现了 I/O 线程模型，客户端连接被分配给各个 I/O 线程处理读写，主线程专注于执行命令，官方数据显示高并发下吞吐有明显提升。
+
+何时开启 I/O 线程：CPU 核数 ≥ 4、实例网络流量大（QPS 很高或 value 较大）、主线程 CPU 接近 100% 但主要在做网络 I/O 时。一般设为核数的一半左右，不超过 8。''',hot=True),
+B(3,"Redis Functions 和 EVAL 脚本有什么区别？",r'''
+| | EVAL 脚本 | Functions（7.0+） |
+|---|---|---|
+| 存储 | 只在脚本缓存中，重启/故障切换后丢失 | 是数据库的一部分，随 RDB/AOF 持久化并复制到从库 |
+| 调用方式 | 每次带脚本或 SHA1 | `FCALL 函数名 numkeys ...` |
+| 组织 | 单个脚本 | 以**库**为单位，一个库可注册多个函数，可共享代码 |
+| 只读声明 | 7.0 起支持 shebang flags | `flags={'no-writes'}`，可用 `FCALL_RO` 在从库执行 |
+| 管理 | SCRIPT LOAD/FLUSH | FUNCTION LOAD/LIST/DELETE/DUMP/RESTORE |
+
+建议：业务中长期使用的逻辑用 Functions；临时、一次性的逻辑用 EVAL。'''),
+B(2,"如何做 Redis 的数据备份与恢复？",r'''
+**备份**：
+1. 定期执行 `BGSAVE`（或依赖 save 配置），把 `dump.rdb` 复制到异地存储（RDB 文件在写完后原子替换，可以安全拷贝）；
+2. 远程备份：`redis-cli --rdb /backup/dump.rdb` 从运行中的实例拉取；
+3. AOF 目录也可以整体备份（需包含 manifest 以及引用的所有文件）。
+
+**恢复**：
+1. 停止实例；
+2. 把 RDB（或 AOF 目录）放到 `dir` 配置的位置，确认 `dbfilename` / `appenddirname`；
+3. 注意：如果开启了 AOF，会优先加载 AOF，要恢复 RDB 需要先关闭 AOF 或放置正确的 AOF；
+4. 启动后核对 `DBSIZE`、抽样数据。
+
+AOF 文件尾部损坏时，可以用 `redis-check-aof --fix` 修复；`aof-load-truncated yes`（默认）允许加载被截断的 AOF。RDB 可以用 `redis-check-rdb` 校验。'''),
+])
